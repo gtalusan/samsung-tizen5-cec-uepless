@@ -49,6 +49,12 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static char names[MAX_DEV][NAME_MAX];
 static int port_by_addr[MAX_DEV];
 static int depth_by_addr[MAX_DEV];
+static int pa_nib[MAX_DEV][3]; /* the three PA nibbles below the port */
+/* Physical address of the currently active stream (the "new PA" of the
+   latest 0x80 Routing Change, or the PA of the latest 0x82 Active Source).
+   -1 = unknown. The device at this PA wins its port's label over the
+   shallowest-device rule, so an AVR's port shows the input it routes. */
+static int active_pa[4] = { -1, -1, -1, -1 };
 static char frames[64][FRAME_MAX * 2 + 1];
 static int frame_n;
 
@@ -65,8 +71,10 @@ static void save_names(void) {
   if (!f) { log_line("state open failed"); return; }
   for (i = 0; i < MAX_DEV; i++) {
     if (names[i][0]) fprintf(f, "N%d|%s\n", i, names[i]);
-    if (port_by_addr[i]) fprintf(f, "P%d|%d|%d\n", i, port_by_addr[i], depth_by_addr[i]);
+    if (port_by_addr[i]) fprintf(f, "P%d|%d|%d|%d|%d|%d\n", i, port_by_addr[i], depth_by_addr[i],
+                                 pa_nib[i][0], pa_nib[i][1], pa_nib[i][2]);
   }
+  if (active_pa[0] >= 0) fprintf(f, "A|%d|%d|%d|%d\n", active_pa[0], active_pa[1], active_pa[2], active_pa[3]);
   fclose(f);
 }
 
@@ -80,16 +88,23 @@ static void load_names(void) {
       char *s = line + n, *e = strpbrk(s, "\r\n");
       if (e) *e = '\0';
       if (s[0]) { strncpy(names[a], s, NAME_MAX - 1); names[a][NAME_MAX - 1] = '\0'; }
-    } else if (sscanf(line, "P%d|%d|%d", &a, &p, &d) == 3 && a >= 0 && a < MAX_DEV) {
+    } else if (sscanf(line, "P%d|%d|%d|%d|%d|%d", &a, &p, &d, &pa_nib[a][0], &pa_nib[a][1], &pa_nib[a][2]) == 6 && a >= 0 && a < MAX_DEV) {
       port_by_addr[a] = p; depth_by_addr[a] = d;
+    } else if (sscanf(line, "P%d|%d|%d", &a, &p, &d) == 3 && a >= 0 && a < MAX_DEV) {
+      port_by_addr[a] = p; depth_by_addr[a] = d; /* older state file without PA nibbles */
+    } else if (sscanf(line, "A|%d|%d|%d|%d", &active_pa[0], &active_pa[1], &active_pa[2], &active_pa[3]) == 4) {
+      /* loaded */
     }
   }
   fclose(f);
 }
 
-/* Frames are [0x80|len][header][op][args…]. Only record 0x47 Set OSD Name
-   (by initiator) and 0x84 Report Physical Address (PA top nibble = HDMI
-   port; depth = count of non-zero PA nibbles below the port). */
+/* Frames are [0x80|len][header][op][args…]. Record 0x47 Set OSD Name (by
+   initiator), 0x84 Report Physical Address (PA top nibble = HDMI port;
+   depth = count of non-zero PA nibbles below the port), and the active
+   stream: 0x80 Routing Change ("new PA" payload) and 0x82 Active Source
+   (PA payload). The active PA is what labels an AVR's port after the
+   input it currently routes. */
 static void parse_frame(const unsigned char *b, int n) {
   int len, init, op, i;
   if (n < 3) return;
@@ -112,7 +127,27 @@ static void parse_frame(const unsigned char *b, int n) {
     if ((b[3] & 0x0F) != 0) d++;
     if ((b[4] >> 4) != 0) d++;
     if ((b[4] & 0x0F) != 0) d++;
-    if (p >= 1 && p <= 4) { port_by_addr[init] = p; depth_by_addr[init] = d; }
+    if (p >= 1 && p <= 4) {
+      port_by_addr[init] = p; depth_by_addr[init] = d;
+      pa_nib[init][0] = b[3] & 0x0F; pa_nib[init][1] = (b[4] >> 4) & 0x0F; pa_nib[init][2] = b[4] & 0x0F;
+    }
+  } else if (op == 0x80 && len >= 5) {
+    /* Routing Change: original PA (2) then new PA (2). */
+    active_pa[0] = (b[5] >> 4) & 0x0F; active_pa[1] = b[5] & 0x0F;
+    active_pa[2] = (b[6] >> 4) & 0x0F; active_pa[3] = b[6] & 0x0F;
+  } else if (op == 0x82 && len >= 3) {
+    /* Active Source: PA (2). The initiator IS the device at that PA, so
+       this also (re)maps the initiator's port and PA nibbles. */
+    int p = (b[3] >> 4) & 0x0F, d = 0;
+    if ((b[3] & 0x0F) != 0) d++;
+    if ((b[4] >> 4) != 0) d++;
+    if ((b[4] & 0x0F) != 0) d++;
+    if (p >= 1 && p <= 4) {
+      port_by_addr[init] = p; depth_by_addr[init] = d;
+      pa_nib[init][0] = b[3] & 0x0F; pa_nib[init][1] = (b[4] >> 4) & 0x0F; pa_nib[init][2] = b[4] & 0x0F;
+    }
+    active_pa[0] = p; active_pa[1] = b[3] & 0x0F;
+    active_pa[2] = (b[4] >> 4) & 0x0F; active_pa[3] = b[4] & 0x0F;
   }
 }
 
@@ -173,14 +208,23 @@ static void json_escape(char *out, size_t cap, const char *s) {
   out[o] = '\0';
 }
 
-/* Port labels: the CEC name of the shallowest device on the port, or null
-   until one is learned (the launcher falls back to "HDMI N"). */
+/* Port labels: the CEC name of the device at the ACTIVE stream PA wins
+   (so an AVR's port shows the input it currently routes); otherwise the
+   shallowest device on the port; null until one is learned. */
 static void build_json(char *out, size_t cap) {
   char esc[NAME_MAX * 2 + 1], *p = out, *end = out + cap;
-  int port_name[MAX_DEV], port_depth[MAX_DEV], i;
-  for (i = 0; i < MAX_DEV; i++) { port_name[i] = -1; port_depth[i] = 99; }
+  int port_name[MAX_DEV], port_depth[MAX_DEV], i, done[MAX_DEV];
+  for (i = 0; i < MAX_DEV; i++) { port_name[i] = -1; port_depth[i] = 99; done[i] = 0; }
+  if (active_pa[0] >= 1 && active_pa[0] <= 4) {
+    for (i = 0; i < MAX_DEV; i++) {
+      if (!names[i][0] || port_by_addr[i] != active_pa[0]) continue;
+      if (pa_nib[i][0] == active_pa[1] && pa_nib[i][1] == active_pa[2] && pa_nib[i][2] == active_pa[3]) {
+        port_name[active_pa[0] - 1] = i; done[active_pa[0] - 1] = 1;
+      }
+    }
+  }
   for (i = 0; i < MAX_DEV; i++) {
-    if (!names[i][0] || !port_by_addr[i]) continue;
+    if (!names[i][0] || !port_by_addr[i] || done[port_by_addr[i] - 1]) continue;
     if (depth_by_addr[i] <= port_depth[port_by_addr[i] - 1]) {
       port_depth[port_by_addr[i] - 1] = depth_by_addr[i];
       port_name[port_by_addr[i] - 1] = i;
@@ -236,14 +280,35 @@ static void serve(void) {
   int ls = listen_sock;
   if (ls < 0) return;
   for (;;) {
-    char json[16384], head[128], req[1024];
+    char json[16384], head[256], req[1024], body[16400], *cb = NULL;
     int c = accept(ls, NULL, NULL), n;
     ssize_t r;
     if (c < 0) continue;
-    r = recv(c, req, sizeof req - 1, 0); (void)r; /* request content is irrelevant */
+    r = recv(c, req, sizeof req - 1, 0);
+    req[r > 0 ? r : 0] = '\0';
     pthread_mutex_lock(&lock);
     build_json(json, sizeof json);
     pthread_mutex_unlock(&lock);
+    /* JSONP: GET /?callback=name wraps the JSON as name({…}); so a web app
+       can load the map through a <script> tag — the XHR/access-policy
+       machinery is not involved (the Tizen engine blocks XHR, not scripts). */
+    cb = strstr(req, "callback=");
+    if (cb) {
+      char cbn[64];
+      int j = 0;
+      cb += 9;
+      while (j < 63 && (isalnum((unsigned char)cb[j]) || cb[j] == '_' || cb[j] == '.')) { cbn[j] = cb[j]; j++; }
+      cbn[j] = '\0';
+      if (j > 0 && snprintf(body, sizeof body, "%s(%s);", cbn, json) < (int)sizeof body) {
+        n = snprintf(head, sizeof head,
+                     "HTTP/1.0 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                     strlen(body));
+        send(c, head, (size_t)n, MSG_NOSIGNAL);
+        send(c, body, strlen(body), MSG_NOSIGNAL);
+        close(c);
+        continue;
+      }
+    }
     n = snprintf(head, sizeof head,
                  "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
                  strlen(json));

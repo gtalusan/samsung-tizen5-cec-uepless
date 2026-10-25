@@ -83,22 +83,27 @@ test; defaults are the TV paths).
 
 ## Field notes (read before touching)
 
+- **Replacing the binary on a live TV turns the TV OFF.** Killing the running
+  cecdump strands its reader thread as an unreapable zombie (see below) and
+  Samsung's health watchdog detects the stuck process and powers the TV down.
+  Deploy updates the safe way: `cat > /opt/bin/cecdump.new && mv -f
+  cecdump.new cecdump`, then **reboot the TV** — the boot loop starts the
+  fresh binary cleanly, and the state file carries the learned names across.
 - **The micom read is uninterruptible.** The reader thread parks in a driver
   wait that ignores `O_NONBLOCK` and never returns. A process that exits with
   the reader blocked strands itself as an unreapable zombie (`Z` + threads)
-  and **pins its binary** (`Text file busy` for later deploys). Therefore
+  and **pins its binary** (`Text file busy` for direct overwrites). Therefore
   `cecdump` binds and listens **before** opening the device — a failed bind
-  exits cleanly with no reader. Replace the binary on a live TV with
-  `cat > /opt/bin/cecdump.new && mv -f cecdump.new cecdump`, never a direct
-  overwrite.
+  exits cleanly with no reader.
 - **UEP**: unsigned binary — it execs only while the UEP gate is patched down
   (any boot whose kernel stage ran: warm reboots with the stick DO fire the
   trigger on this TV, verified 2026-10-25). On stickless boots the retry loop
   gives up quietly after ~3 minutes and CleanFrame keeps plain labels.
-- `SIGTERM` closes the listener before exiting so a `pkill cecdump` always
-  frees `:8787`; the boot loop then restarts it on its own.
+- `SIGTERM` closes the listener before exiting so the port always frees; the
+  boot loop then restarts it on its own.
 - State file: `/opt/usr/share/tvroot/cec/cec-names.txt`, same line format as
-  the old TPK service (`N<addr>|<name>`, `P<addr>|<port>|<depth>`) so the two
+  the old TPK service (`N<addr>|<name>`, `P<addr>|<port>|<depth>|<n1>|<n2>|<n3>`,
+  `A|<port>|<n1>|<n2>|<n3>` for the active stream PA) so the two
   implementations stay interchangeable.
 
 ## License
